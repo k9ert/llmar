@@ -5,11 +5,15 @@ dirs and invokes the script as a subprocess, so the module-level config is
 re-read fresh each run.
 """
 
+import hashlib
+import http.server
 import json
 import os
 import shutil
+import socketserver
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -330,6 +334,184 @@ class TestRoundTrip(Base):
         entry = self.reg()["models"]["pub/m"]
         self.assertEqual(entry["description"], "a model with history")
         self.assertEqual(len(entry["journal"]), 1)
+
+
+DUMMY_LLMAR = b"""#!/usr/bin/env python3
+__version__ = "v9.9.9"
+
+import sys
+
+
+def main():
+    if "--version" in sys.argv:
+        print("llmar v9.9.9")
+        sys.exit(0)
+    print("dummy llmar v9.9.9")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+class _RouteHandler(http.server.BaseHTTPRequestHandler):
+    routes: dict = {}
+
+    def do_GET(self):  # noqa: N802
+        body = self.routes.get(self.path)
+        if body is None:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args, **kwargs):
+        pass
+
+
+def make_server(routes: dict):
+    handler_cls = type("H", (_RouteHandler,), {"routes": routes})
+    server = socketserver.TCPServer(("127.0.0.1", 0), handler_cls)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+class TestUpdate(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="llmar-update-"))
+        # working copy of llmar so updates don't clobber the dev script
+        self.script = self.tmp / "llmar"
+        src = LLMAR.read_text()
+        # set a known starting version so same-version skip can be tested
+        src = src.replace('__version__ = "dev"', '__version__ = "v0.0.1"', 1)
+        self.script.write_text(src)
+        os.chmod(self.script, 0o755)
+
+        # default served bytes + checksum
+        self.new_bytes = DUMMY_LLMAR
+        self.new_sha = hashlib.sha256(self.new_bytes).hexdigest()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, *args, routes=None, check=True):
+        if routes is None:
+            routes = self._default_routes()
+        server, _ = make_server(routes)
+        port = server.server_address[1]
+        try:
+            env = os.environ.copy()
+            env["LLMAR_RELEASE_API"] = f"http://127.0.0.1:{port}/api"
+            env["LLMAR_RELEASE_DOWNLOAD"] = f"http://127.0.0.1:{port}/dl"
+            # isolate other env so module-level config doesn't trip on
+            # missing dirs etc.
+            env["LLMAR_LOCAL_DIR"] = str(self.tmp / "local")
+            env["LLMAR_ARCHIVE_DIR"] = str(self.tmp / "archive")
+            env["LLMAR_REGISTRY"] = str(self.tmp / "registry.json")
+            r = subprocess.run(
+                ["python3", str(self.script), "update", *args],
+                capture_output=True, text=True, env=env, timeout=15,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+        if check and r.returncode != 0:
+            self.fail(
+                f"update {args} failed (exit {r.returncode})\n"
+                f"stdout={r.stdout}\nstderr={r.stderr}"
+            )
+        return r
+
+    def _default_routes(self) -> dict:
+        return {
+            "/api/releases/latest": json.dumps({"tag_name": "v9.9.9"}).encode(),
+            "/api/releases": json.dumps(
+                [{"tag_name": "v9.9.9-pre"}, {"tag_name": "v9.9.9"}]
+            ).encode(),
+            "/dl/v9.9.9/llmar": self.new_bytes,
+            "/dl/v9.9.9/llmar.sha256": f"{self.new_sha}  llmar\n".encode(),
+            "/dl/v9.9.9-pre/llmar": self.new_bytes,
+            "/dl/v9.9.9-pre/llmar.sha256": f"{self.new_sha}  llmar\n".encode(),
+        }
+
+    def test_update_to_latest(self):
+        r = self._run()
+        self.assertIn("v0.0.1 -> v9.9.9", r.stdout)
+        self.assertEqual(self.script.read_bytes(), self.new_bytes)
+        # the replaced script reports the new version
+        v = subprocess.run(
+            ["python3", str(self.script), "--version"],
+            capture_output=True, text=True,
+        )
+        self.assertIn("v9.9.9", v.stdout)
+
+    def test_update_explicit_tag(self):
+        r = self._run("v9.9.9")
+        self.assertIn("v9.9.9", r.stdout)
+        self.assertEqual(self.script.read_bytes(), self.new_bytes)
+
+    def test_update_pre(self):
+        r = self._run("--pre")
+        self.assertIn("v9.9.9-pre", r.stdout)
+        self.assertEqual(self.script.read_bytes(), self.new_bytes)
+
+    def test_same_version_no_op(self):
+        r = self._run("v0.0.1")
+        self.assertIn("already on v0.0.1", r.stdout)
+        # script untouched
+        self.assertIn(b'__version__ = "v0.0.1"', self.script.read_bytes())
+
+    def test_force_reinstalls_same_version(self):
+        # serve v0.0.1 with matching script
+        same_bytes = DUMMY_LLMAR.replace(b'v9.9.9', b'v0.0.1')
+        same_sha = hashlib.sha256(same_bytes).hexdigest()
+        routes = {
+            "/dl/v0.0.1/llmar": same_bytes,
+            "/dl/v0.0.1/llmar.sha256": f"{same_sha}  llmar\n".encode(),
+        }
+        r = self._run("v0.0.1", "--force", routes=routes)
+        self.assertIn("v0.0.1 -> v0.0.1", r.stdout)
+        self.assertEqual(self.script.read_bytes(), same_bytes)
+
+    def test_checksum_mismatch_refuses(self):
+        original = self.script.read_bytes()
+        bad_routes = self._default_routes()
+        bad_routes["/dl/v9.9.9/llmar.sha256"] = b"0" * 64 + b"  llmar\n"
+        r = self._run(routes=bad_routes, check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("checksum mismatch", r.stderr)
+        self.assertEqual(self.script.read_bytes(), original)
+
+    def test_unknown_tag_refuses(self):
+        original = self.script.read_bytes()
+        # default routes have nothing for v1.2.3
+        r = self._run("v1.2.3", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.script.read_bytes(), original)
+
+    def test_sanity_check_rejects_non_python(self):
+        original = self.script.read_bytes()
+        bad = b"not a python script\n"
+        bad_sha = hashlib.sha256(bad).hexdigest()
+        routes = {
+            "/api/releases/latest": json.dumps({"tag_name": "v9.9.9"}).encode(),
+            "/dl/v9.9.9/llmar": bad,
+            "/dl/v9.9.9/llmar.sha256": f"{bad_sha}  llmar\n".encode(),
+        }
+        r = self._run(routes=routes, check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("does not look like the llmar script", r.stderr)
+        self.assertEqual(self.script.read_bytes(), original)
+
+
+class TestVersion(Base):
+    def test_version_flag(self):
+        r = self.run_cli("--version")
+        self.assertIn("llmar", r.stdout)
 
 
 if __name__ == "__main__":

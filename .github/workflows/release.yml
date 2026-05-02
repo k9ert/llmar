@@ -17,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Inject version
+        run: sed -i 's/^__version__ = ".*"$/__version__ = "${{ github.ref_name }}"/' llmar
       - name: Generate checksum
         run: sha256sum llmar > llmar.sha256
       - name: Create release
