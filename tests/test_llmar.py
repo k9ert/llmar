@@ -514,5 +514,58 @@ class TestVersion(Base):
         self.assertIn("llmar", r.stdout)
 
 
+class TestCompletion(Base):
+    def test_bash_emits_script(self):
+        r = self.run_cli("completion", "bash")
+        self.assertIn("_llmar_complete", r.stdout)
+        self.assertIn("complete -F _llmar_complete llmar", r.stdout)
+
+    def test_bash_script_syntax_valid(self):
+        r = self.run_cli("completion", "bash")
+        script = self.tmp / "llmar.bash"
+        script.write_text(r.stdout)
+        check = subprocess.run(
+            ["bash", "-n", str(script)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(check.returncode, 0,
+                         f"bash -n failed: {check.stderr}")
+
+    def test_zsh_emits_script(self):
+        r = self.run_cli("completion", "zsh")
+        self.assertIn("compdef _llmar llmar", r.stdout)
+        self.assertIn("_llmar()", r.stdout)
+
+    def test_zsh_script_syntax_valid(self):
+        if not shutil.which("zsh"):
+            self.skipTest("zsh not available")
+        r = self.run_cli("completion", "zsh")
+        script = self.tmp / "llmar.zsh"
+        script.write_text(r.stdout)
+        check = subprocess.run(
+            ["zsh", "-n", str(script)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(check.returncode, 0,
+                         f"zsh -n failed: {check.stderr}")
+
+    def test_complete_models_empty(self):
+        r = self.run_cli("_complete-models")
+        self.assertEqual(r.stdout.strip(), "")
+
+    def test_complete_models_lists_local_and_archive(self):
+        make_model(self.local, "pub/local-only")
+        make_model(self.archive, "pub/archive-only")
+        make_model(self.local, "pub/both")
+        make_model(self.archive, "pub/both")
+        r = self.run_cli("_complete-models")
+        lines = r.stdout.strip().splitlines()
+        # deduped + sorted
+        self.assertEqual(lines, sorted(set(lines)))
+        self.assertIn("pub/local-only", lines)
+        self.assertIn("pub/archive-only", lines)
+        self.assertIn("pub/both", lines)
+
+
 if __name__ == "__main__":
     unittest.main()

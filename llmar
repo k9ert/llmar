@@ -741,6 +741,80 @@ def cmd_update(args) -> int:
     return 0
 
 
+# ---------- Shell completion ----------
+
+_BASH_COMPLETION = r"""_llmar_complete() {
+    local cur
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    local subs="list pin unpin archive backup restore desc log update completion"
+    local model_cmds=" pin unpin archive backup restore desc log "
+
+    if [[ $COMP_CWORD -eq 1 ]]; then
+        COMPREPLY=( $(compgen -W "$subs --version --help" -- "$cur") )
+        return
+    fi
+    local s="${COMP_WORDS[1]}"
+    if [[ "$model_cmds" == *" $s "* ]] && [[ $COMP_CWORD -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "$(llmar _complete-models 2>/dev/null)" -- "$cur") )
+        return
+    fi
+    case "$s" in
+        archive|backup) COMPREPLY=( $(compgen -W "--force" -- "$cur") ) ;;
+        update)         COMPREPLY=( $(compgen -W "--force --pre" -- "$cur") ) ;;
+        completion)
+            [[ $COMP_CWORD -eq 2 ]] && COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
+            ;;
+    esac
+}
+complete -F _llmar_complete llmar
+"""
+
+_ZSH_COMPLETION = r"""#compdef llmar
+_llmar() {
+    local -a subs model_cmds
+    subs=(list pin unpin archive backup restore desc log update completion)
+    model_cmds=(pin unpin archive backup restore desc log)
+
+    if (( CURRENT == 2 )); then
+        _values 'subcommand' "${subs[@]}" '--version' '--help'
+        return
+    fi
+
+    local s="${words[2]}"
+    if (( CURRENT == 3 )) && (( ${model_cmds[(I)$s]} )); then
+        local -a models
+        models=(${(f)"$(llmar _complete-models 2>/dev/null)"})
+        _values 'model' "${models[@]}"
+        return
+    fi
+
+    case "$s" in
+        archive|backup) _values 'flag' '--force' ;;
+        update)         _values 'flag' '--force' '--pre' ;;
+        completion)     (( CURRENT == 3 )) && _values 'shell' 'bash' 'zsh' ;;
+    esac
+}
+compdef _llmar llmar
+"""
+
+
+def cmd_completion(args) -> int:
+    if args.shell == "bash":
+        sys.stdout.write(_BASH_COMPLETION)
+    else:
+        sys.stdout.write(_ZSH_COMPLETION)
+    return 0
+
+
+def cmd_complete_models(args) -> int:
+    local = set(find_models(LOCAL_DIR))
+    archive = set(find_models(ARCHIVE_DIR)) if ARCHIVE_DIR.exists() else set()
+    for m in sorted(local | archive):
+        print(m)
+    return 0
+
+
 # ---------- Main ----------
 
 def main() -> int:
@@ -817,6 +891,13 @@ def main() -> int:
     p.add_argument("--pre", action="store_true",
                    help="include pre-releases when resolving latest")
 
+    p = sub.add_parser("completion",
+                       help="emit shell completion script (bash, zsh)")
+    p.add_argument("shell", choices=["bash", "zsh"])
+
+    sub.add_parser("_complete-models",
+                   help="list known model ids (used by completion scripts)")
+
     args = parser.parse_args()
 
     handlers = {
@@ -829,6 +910,8 @@ def main() -> int:
         "desc":    cmd_desc,
         "log":     cmd_log,
         "update":  cmd_update,
+        "completion":        cmd_completion,
+        "_complete-models":  cmd_complete_models,
     }
     return handlers[args.cmd](args)
 

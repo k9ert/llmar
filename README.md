@@ -57,6 +57,20 @@ llmar log     <model> [text]      # append journal entry
 Every command that touches a model needs a one-line description. You'll be
 prompted for one if it's missing.
 
+## Shell completion
+
+```sh
+# bash
+mkdir -p ~/.local/share/bash-completion/completions
+llmar completion bash > ~/.local/share/bash-completion/completions/llmar
+
+# zsh — write into a directory on your $fpath
+llmar completion zsh > ~/.zsh/completions/_llmar
+```
+
+Open a new shell to pick it up. Tab-completes subcommands, flags, and model
+ids (queried live from your local + archive dirs).
+
 ## Configuration
 
 | env var                    | default                              |
