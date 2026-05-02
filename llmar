@@ -1,0 +1,724 @@
+#!/usr/bin/env python3
+"""
+lmmar — LM Studio Model ARchiver
+
+Manage local LLM models between your fast local disk and an external archive
+drive. Designed for LM Studio + oMLX, both of which use a two-level model
+directory layout: <publisher>/<model-name>/<weights, config, tokenizer, ...>
+
+Configuration (all overridable via env vars):
+  LMMAR_LOCAL_DIR    Local model directory   default: ~/.lmstudio/models
+  LMMAR_ARCHIVE_DIR  Archive directory       default: /Volumes/INTENSO/llm-archive
+  LMMAR_REGISTRY     Registry path           default: ~/.lmmar/registry.json
+
+Commands:
+  list                  Show models on local + archive, with pin status & description
+  pin     <model>       Mark a model to stay on local disk
+  unpin   <model>       Allow a model to be archived
+  archive [<model>]     Move local model(s) to the archive. With no argument,
+                        archives every unpinned local model. With <model>, just
+                        that one (refuses if pinned, unless --force).
+  backup  [<model>]     Copy local model(s) to the archive WITHOUT removing the
+                        local copy. With no argument, copies every local model
+                        not yet in the archive. With <model>, just that one.
+                        Use --force to overwrite an existing archive copy.
+  restore <model>       Copy a model from the archive back to local
+  desc    <model>          Show description + full journal for a model
+  desc    <model> <text>   Set / update the one-line description
+  log     <model> [text]   Append a journal entry. Without [text], opens $EDITOR.
+
+Every command that touches a model requires a one-line description. You'll be
+prompted to enter one if it's missing.
+
+Models are referenced by their two-level id, e.g.
+  mlx-community/Qwen3-30B-A3B-MLX-4bit
+"""
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ---------- Configuration ----------
+
+LOCAL_DIR = Path(os.environ.get(
+    "LMMAR_LOCAL_DIR",
+    str(Path.home() / ".lmstudio" / "models"),
+))
+ARCHIVE_DIR = Path(os.environ.get(
+    "LMMAR_ARCHIVE_DIR",
+    "/Volumes/INTENSO/llm-archive",
+))
+REGISTRY_PATH = Path(os.environ.get(
+    "LMMAR_REGISTRY",
+    str(Path.home() / ".lmmar" / "registry.json"),
+))
+
+
+# ---------- Registry ----------
+
+def load_registry() -> dict:
+    if not REGISTRY_PATH.exists():
+        return {"models": {}}
+    try:
+        with open(REGISTRY_PATH) as f:
+            data = json.load(f)
+        if "models" not in data or not isinstance(data["models"], dict):
+            data["models"] = {}
+        return data
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"warning: could not read registry ({e}), starting empty",
+              file=sys.stderr)
+        return {"models": {}}
+
+
+def save_registry(registry: dict) -> None:
+    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = REGISTRY_PATH.with_suffix(REGISTRY_PATH.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(registry, f, indent=2, sort_keys=True)
+    tmp.replace(REGISTRY_PATH)
+
+
+def get_entry(registry: dict, model_id: str) -> dict:
+    return registry["models"].setdefault(model_id, {})
+
+
+def is_pinned(registry: dict, model_id: str) -> bool:
+    return registry["models"].get(model_id, {}).get("pinned", False)
+
+
+def get_description(registry: dict, model_id: str) -> str:
+    return registry["models"].get(model_id, {}).get("description", "")
+
+
+# ---------- Model discovery ----------
+
+def find_models(root: Path) -> list:
+    """Return ['publisher/name', ...] for the two-level dirs under root."""
+    if not root.exists() or not root.is_dir():
+        return []
+    out = []
+    for pub in sorted(root.iterdir()):
+        if not pub.is_dir() or pub.name.startswith("."):
+            continue
+        for mdl in sorted(pub.iterdir()):
+            if not mdl.is_dir() or mdl.name.startswith("."):
+                continue
+            out.append(f"{pub.name}/{mdl.name}")
+    return out
+
+
+def dir_size(path: Path) -> int:
+    total = 0
+    try:
+        for p in path.rglob("*"):
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def human_size(n: int) -> str:
+    f = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if f < 1024.0:
+            return f"{f:.1f} {unit}"
+        f /= 1024.0
+    return f"{f:.1f} PB"
+
+
+# ---------- Description prompting ----------
+
+def ensure_description(registry: dict, model_id: str) -> bool:
+    """Prompt for a description if missing. Returns False if user aborts/empty."""
+    if get_description(registry, model_id):
+        return True
+    print(f"\n  no description for: {model_id}")
+    try:
+        desc = input("  one-line description (empty = skip): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if not desc:
+        return False
+    get_entry(registry, model_id)["description"] = desc
+    save_registry(registry)
+    return True
+
+
+def now_ts() -> str:
+    """UTC timestamp in compact ISO-ish form: 2026-05-02T14:23:07Z"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def fmt_ts(ts: str) -> str:
+    """Render a stored timestamp as YYYY-MM-DD HH:MM (UTC)."""
+    try:
+        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except (ValueError, TypeError):
+        return ts or "?"
+
+
+def read_from_editor(initial_hint: str = "") -> str:
+    """Open $EDITOR for a multi-line entry. Falls back to stdin if unset.
+
+    Lines starting with '#' are stripped (treated as comments / instructions).
+    """
+    editor = os.environ.get("EDITOR", "").strip()
+    if not editor:
+        print("no $EDITOR set — type your entry, then Ctrl-D on a blank line:")
+        try:
+            return sys.stdin.read().strip()
+        except KeyboardInterrupt:
+            return ""
+
+    template = (
+        "\n"
+        "# Enter your journal entry above. Save and close to commit.\n"
+        "# Lines starting with '#' are removed. Empty content cancels.\n"
+    )
+    if initial_hint:
+        template = f"# {initial_hint}\n" + template
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", delete=False, encoding="utf-8"
+    ) as f:
+        f.write(template)
+        path = f.name
+
+    try:
+        cmd = shlex.split(editor) + [path]
+        subprocess.run(cmd, check=False)
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    lines = [l for l in content.splitlines() if not l.lstrip().startswith("#")]
+    return "\n".join(lines).strip()
+
+
+# ---------- File operations ----------
+
+def copy_tree(src: Path, dst: Path) -> None:
+    """Copy directory; uses rsync with progress when available."""
+    if dst.exists():
+        raise FileExistsError(f"destination exists: {dst}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    if shutil.which("rsync"):
+        # Trailing slashes: copy contents of src into newly-created dst
+        cmd = [
+            "rsync", "-a", "--human-readable", "--progress",
+            f"{src}/", f"{dst}/",
+        ]
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            shutil.rmtree(dst, ignore_errors=True)
+            raise RuntimeError(f"rsync failed (exit {result.returncode})")
+    else:
+        shutil.copytree(src, dst)
+
+
+def confirm(prompt: str) -> bool:
+    try:
+        resp = input(f"{prompt} [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return resp == "y"
+
+
+# ---------- Commands ----------
+
+def cmd_list(args) -> int:
+    registry = load_registry()
+    local = set(find_models(LOCAL_DIR))
+    archive = set(find_models(ARCHIVE_DIR)) if ARCHIVE_DIR.exists() else set()
+    all_models = sorted(local | archive)
+
+    if not all_models:
+        print("no models found.")
+        print(f"  local:   {LOCAL_DIR}"
+              + ("" if LOCAL_DIR.exists() else "  (does not exist)"))
+        print(f"  archive: {ARCHIVE_DIR}"
+              + ("" if ARCHIVE_DIR.exists() else "  (not mounted)"))
+        return 0
+
+    if not ARCHIVE_DIR.exists():
+        print(f"(archive drive not mounted: {ARCHIVE_DIR})\n")
+
+    # Header
+    header = f"{'P':1} {'LOC':3} {'SIZE':>10}  {'MODEL':52}  DESCRIPTION"
+    print(header)
+    print("-" * max(len(header), 100))
+
+    total_local = total_archive = 0
+    for m in all_models:
+        pinned = "*" if is_pinned(registry, m) else " "
+        loc = ("L" if m in local else "-") + ("A" if m in archive else "-")
+        # Display size: prefer local (faster), fall back to archive.
+        if m in local:
+            sz = dir_size(LOCAL_DIR / m)
+            total_local += sz
+            if m in archive:
+                total_archive += dir_size(ARCHIVE_DIR / m)
+        else:
+            sz = dir_size(ARCHIVE_DIR / m)
+            total_archive += sz
+        desc = get_description(registry, m) or "(no description)"
+        print(f"{pinned} {loc:3} {human_size(sz):>10}  {m:52}  {desc}")
+
+    print()
+    print(f"legend: P=* pinned, LOC=L(local) A(archive)")
+    print(f"local:   {LOCAL_DIR}    ({human_size(total_local)} across "
+          f"{len(local)} model(s))")
+    if ARCHIVE_DIR.exists():
+        print(f"archive: {ARCHIVE_DIR}    ({human_size(total_archive)} across "
+              f"{len(archive)} model(s))")
+    return 0
+
+
+def _validate_exists(model_id: str, must_be_local=False, must_be_archive=False):
+    local = model_id in find_models(LOCAL_DIR)
+    archive = (model_id in find_models(ARCHIVE_DIR)) if ARCHIVE_DIR.exists() else False
+    if not local and not archive:
+        print(f"error: model '{model_id}' not found in local or archive.",
+              file=sys.stderr)
+        sys.exit(1)
+    if must_be_local and not local:
+        print(f"error: model '{model_id}' not on local disk.", file=sys.stderr)
+        sys.exit(1)
+    if must_be_archive and not archive:
+        print(f"error: model '{model_id}' not in archive.", file=sys.stderr)
+        sys.exit(1)
+    return local, archive
+
+
+def cmd_pin(args) -> int:
+    registry = load_registry()
+    _validate_exists(args.model)
+    if not ensure_description(registry, args.model):
+        print("aborted: description required.", file=sys.stderr)
+        return 1
+    get_entry(registry, args.model)["pinned"] = True
+    save_registry(registry)
+    print(f"pinned: {args.model}")
+    return 0
+
+
+def cmd_unpin(args) -> int:
+    registry = load_registry()
+    _validate_exists(args.model)
+    if not ensure_description(registry, args.model):
+        print("aborted: description required.", file=sys.stderr)
+        return 1
+    get_entry(registry, args.model)["pinned"] = False
+    save_registry(registry)
+    print(f"unpinned: {args.model}")
+    return 0
+
+
+def cmd_archive(args) -> int:
+    registry = load_registry()
+    if not ARCHIVE_DIR.exists():
+        print(f"error: archive directory not available: {ARCHIVE_DIR}",
+              file=sys.stderr)
+        print("is the external drive mounted?", file=sys.stderr)
+        return 1
+
+    local = find_models(LOCAL_DIR)
+
+    if args.model:
+        # Single-model mode (handy for bootstrapping without a huge sync).
+        if args.model not in local:
+            print(f"error: model '{args.model}' not on local disk.",
+                  file=sys.stderr)
+            return 1
+        if is_pinned(registry, args.model) and not args.force:
+            print(f"error: '{args.model}' is pinned. unpin it first, "
+                  "or pass --force.", file=sys.stderr)
+            return 1
+        candidates = [args.model]
+    else:
+        # All-unpinned mode (the original behavior).
+        candidates = [m for m in local if not is_pinned(registry, m)]
+        if not candidates:
+            print("no unpinned local models — nothing to archive.")
+            return 0
+
+    return _perform_archive(registry, candidates)
+
+
+def _perform_archive(registry: dict, candidates: list) -> int:
+    """Shared archive workflow: show summary, collect descriptions, confirm, move."""
+    n = len(candidates)
+    print(f"found {n} model(s) to archive:")
+    total = 0
+    for m in candidates:
+        sz = dir_size(LOCAL_DIR / m)
+        total += sz
+        flag = "" if get_description(registry, m) else "  [needs description]"
+        print(f"  {human_size(sz):>10}  {m}{flag}")
+    if n > 1:
+        print(f"  {'-'*10}")
+        print(f"  {human_size(total):>10}  total")
+
+    # Collect any missing descriptions BEFORE we start moving GBs around.
+    print("\nchecking descriptions ...")
+    final_list = []
+    for m in candidates:
+        if not ensure_description(registry, m):
+            print(f"  skipping {m} (no description)")
+            continue
+        final_list.append(m)
+
+    if not final_list:
+        print("nothing to archive.")
+        return 0
+
+    print(f"\nready to archive {len(final_list)} model(s) to: {ARCHIVE_DIR}")
+    print("each model is COPIED to the archive, then REMOVED from local disk.")
+    if not confirm("proceed?"):
+        print("aborted.")
+        return 1
+
+    failed = []
+    for m in final_list:
+        src = LOCAL_DIR / m
+        dst = ARCHIVE_DIR / m
+        print(f"\n[{m}]")
+        try:
+            if dst.exists():
+                # Already archived (e.g., previously restored without removal).
+                # We trust the archive copy and just drop local.
+                print("  already in archive — removing local copy.")
+                shutil.rmtree(src)
+            else:
+                print("  copying to archive ...")
+                copy_tree(src, dst)
+                print("  removing local copy ...")
+                shutil.rmtree(src)
+            print("  done.")
+        except Exception as e:
+            print(f"  ERROR: {e}", file=sys.stderr)
+            failed.append(m)
+
+    print()
+    if failed:
+        print(f"completed with {len(failed)} failure(s):", file=sys.stderr)
+        for m in failed:
+            print(f"  - {m}", file=sys.stderr)
+        return 1
+    print(f"archived {len(final_list)} model(s).")
+    return 0
+
+
+def cmd_backup(args) -> int:
+    registry = load_registry()
+    if not ARCHIVE_DIR.exists():
+        print(f"error: archive directory not available: {ARCHIVE_DIR}",
+              file=sys.stderr)
+        print("is the external drive mounted?", file=sys.stderr)
+        return 1
+
+    local = find_models(LOCAL_DIR)
+    archived = set(find_models(ARCHIVE_DIR))
+
+    if args.model:
+        # Single-model mode.
+        if args.model not in local:
+            print(f"error: model '{args.model}' not on local disk.",
+                  file=sys.stderr)
+            return 1
+        if args.model in archived and not args.force:
+            print(f"'{args.model}' is already in archive. "
+                  "pass --force to overwrite.", file=sys.stderr)
+            return 1
+        candidates = [args.model]
+    else:
+        # All-local mode. Default skips models already archived (they're
+        # immutable, so re-copying is just wasted IO).
+        if args.force:
+            candidates = local
+        else:
+            candidates = [m for m in local if m not in archived]
+        if not candidates:
+            if args.force:
+                print("no local models to back up.")
+            else:
+                print("all local models are already in the archive. "
+                      "pass --force to refresh.")
+            return 0
+
+    return _perform_backup(registry, candidates)
+
+
+def _perform_backup(registry: dict, candidates: list) -> int:
+    """Copy local models to the archive; the local copy stays in place."""
+    n = len(candidates)
+    print(f"found {n} model(s) to back up:")
+    total = 0
+    for m in candidates:
+        sz = dir_size(LOCAL_DIR / m)
+        total += sz
+        flag = "" if get_description(registry, m) else "  [needs description]"
+        print(f"  {human_size(sz):>10}  {m}{flag}")
+    if n > 1:
+        print(f"  {'-'*10}")
+        print(f"  {human_size(total):>10}  total")
+
+    print("\nchecking descriptions ...")
+    final_list = []
+    for m in candidates:
+        if not ensure_description(registry, m):
+            print(f"  skipping {m} (no description)")
+            continue
+        final_list.append(m)
+
+    if not final_list:
+        print("nothing to back up.")
+        return 0
+
+    print(f"\nready to back up {len(final_list)} model(s) to: {ARCHIVE_DIR}")
+    print("each model is COPIED to the archive; the local copy stays in place.")
+    if not confirm("proceed?"):
+        print("aborted.")
+        return 1
+
+    failed = []
+    for m in final_list:
+        src = LOCAL_DIR / m
+        dst = ARCHIVE_DIR / m
+        print(f"\n[{m}]")
+        try:
+            if dst.exists():
+                # Reachable only via --force; replace existing archive copy.
+                print("  removing existing archive copy ...")
+                shutil.rmtree(dst)
+            print("  copying to archive ...")
+            copy_tree(src, dst)
+            print("  done.")
+        except Exception as e:
+            print(f"  ERROR: {e}", file=sys.stderr)
+            failed.append(m)
+
+    print()
+    if failed:
+        print(f"completed with {len(failed)} failure(s):", file=sys.stderr)
+        for m in failed:
+            print(f"  - {m}", file=sys.stderr)
+        return 1
+    print(f"backed up {len(final_list)} model(s).")
+    return 0
+
+
+def cmd_restore(args) -> int:
+    registry = load_registry()
+    if not ARCHIVE_DIR.exists():
+        print(f"error: archive directory not available: {ARCHIVE_DIR}",
+              file=sys.stderr)
+        return 1
+
+    local, _ = _validate_exists(args.model, must_be_archive=True)
+    if local:
+        print(f"error: model already exists locally at "
+              f"{LOCAL_DIR / args.model}", file=sys.stderr)
+        return 1
+
+    if not ensure_description(registry, args.model):
+        print("aborted: description required.", file=sys.stderr)
+        return 1
+
+    src = ARCHIVE_DIR / args.model
+    dst = LOCAL_DIR / args.model
+    sz = dir_size(src)
+    print(f"restoring {args.model} ({human_size(sz)}) ...")
+    try:
+        copy_tree(src, dst)
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"restored: {dst}")
+    return 0
+
+
+def cmd_desc(args) -> int:
+    registry = load_registry()
+    _validate_exists(args.model)
+
+    # Write mode: text was given on the command line.
+    if args.description is not None:
+        desc = args.description.strip()
+        if not desc:
+            print("aborted: empty description.", file=sys.stderr)
+            return 1
+        get_entry(registry, args.model)["description"] = desc
+        save_registry(registry)
+        print(f"updated: {args.model}")
+        return 0
+
+    # Read mode: dump description + journal.
+    entry = registry["models"].get(args.model, {})
+    desc = entry.get("description", "")
+    journal = entry.get("journal", [])
+    pinned = " [pinned]" if entry.get("pinned") else ""
+
+    print(f"{args.model}{pinned}")
+    if desc:
+        print(f"  description: {desc}")
+    else:
+        print(f"  description: (none)")
+
+    if not journal:
+        print(f"  journal:     (empty)")
+        return 0
+
+    word = "entry" if len(journal) == 1 else "entries"
+    print(f"  journal:     {len(journal)} {word}")
+    print()
+    for e in journal:
+        ts = fmt_ts(e.get("ts", ""))
+        text = e.get("text", "")
+        if "\n" in text:
+            print(f"  [{ts}]")
+            for line in text.splitlines():
+                print(f"      {line}" if line else "")
+            print()
+        else:
+            print(f"  [{ts}]  {text}")
+    return 0
+
+
+def cmd_log(args) -> int:
+    registry = load_registry()
+    _validate_exists(args.model)
+
+    # Description is required (consistent with pin / unpin / restore).
+    if not ensure_description(registry, args.model):
+        print("aborted: description required.", file=sys.stderr)
+        return 1
+
+    if args.text:
+        text = args.text.strip()
+    else:
+        text = read_from_editor(initial_hint=f"journal entry for {args.model}")
+
+    if not text:
+        print("aborted: empty entry.", file=sys.stderr)
+        return 1
+
+    entry = get_entry(registry, args.model)
+    journal = entry.setdefault("journal", [])
+    journal.append({"ts": now_ts(), "text": text})
+    save_registry(registry)
+
+    preview = text.splitlines()[0]
+    if len(preview) > 60:
+        preview = preview[:57] + "..."
+    print(f"logged: {args.model}  ({len(journal)} entr"
+          f"{'y' if len(journal)==1 else 'ies'} total)")
+    print(f"  > {preview}")
+    return 0
+
+
+# ---------- Main ----------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="lmmar",
+        description="LM Studio model archiver — local <-> external drive",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "env vars:\n"
+            "  LMMAR_LOCAL_DIR     local model directory\n"
+            "  LMMAR_ARCHIVE_DIR   archive directory\n"
+            "  LMMAR_REGISTRY      registry json path\n"
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    sub.add_parser("list", help="list models on local + archive")
+
+    p = sub.add_parser("pin", help="pin a model (keep on local)")
+    p.add_argument("model", help="model id (publisher/name)")
+
+    p = sub.add_parser("unpin", help="unpin a model")
+    p.add_argument("model", help="model id (publisher/name)")
+
+    p = sub.add_parser(
+        "archive",
+        help="move local model(s) to archive (one model, or all unpinned)",
+    )
+    p.add_argument("model", nargs="?",
+                   help="specific model to archive; if omitted, archives ALL "
+                        "unpinned local models")
+    p.add_argument("--force", action="store_true",
+                   help="archive even if pinned (only meaningful with <model>)")
+
+    p = sub.add_parser(
+        "backup",
+        help="copy local model(s) to archive without deleting local",
+    )
+    p.add_argument("model", nargs="?",
+                   help="specific model to back up; if omitted, copies every "
+                        "local model not yet in the archive")
+    p.add_argument("--force", action="store_true",
+                   help="overwrite an existing archive copy")
+
+    p = sub.add_parser("restore", help="copy a model from archive back to local")
+    p.add_argument("model", help="model id (publisher/name)")
+
+    p = sub.add_parser(
+        "desc",
+        help="show description + journal, or set description if text given",
+    )
+    p.add_argument("model", help="model id (publisher/name)")
+    p.add_argument("description", nargs="?",
+                   help="if given, sets the description; if omitted, prints "
+                        "description + journal")
+
+    p = sub.add_parser(
+        "log",
+        help="append a journal entry (opens $EDITOR if no text given)",
+    )
+    p.add_argument("model", help="model id (publisher/name)")
+    p.add_argument("text", nargs="?",
+                   help="entry text; if omitted, opens $EDITOR for multi-line")
+
+    args = parser.parse_args()
+
+    handlers = {
+        "list":    cmd_list,
+        "pin":     cmd_pin,
+        "unpin":   cmd_unpin,
+        "archive": cmd_archive,
+        "backup":  cmd_backup,
+        "restore": cmd_restore,
+        "desc":    cmd_desc,
+        "log":     cmd_log,
+    }
+    return handlers[args.cmd](args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\ninterrupted.", file=sys.stderr)
+        sys.exit(130)
