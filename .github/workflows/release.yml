@@ -1,0 +1,29 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate checksum
+        run: sha256sum llmar > llmar.sha256
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            llmar
+            llmar.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
