@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-lmmar — LM Studio Model ARchiver
+llmar — LM Studio Model ARchiver
 
 Manage local LLM models between your fast local disk and an external archive
 drive. Designed for LM Studio + oMLX, both of which use a two-level model
 directory layout: <publisher>/<model-name>/<weights, config, tokenizer, ...>
 
 Configuration (all overridable via env vars):
-  LMMAR_LOCAL_DIR    Local model directory   default: ~/.lmstudio/models
-  LMMAR_ARCHIVE_DIR  Archive directory       default: /Volumes/INTENSO/llm-archive
-  LMMAR_REGISTRY     Registry path           default: ~/.lmmar/registry.json
+  LLMAR_LOCAL_DIR    Local model directory   default: ~/.lmstudio/models
+  LLMAR_ARCHIVE_DIR  Archive directory       default: /Volumes/INTENSO/llm-archive
+  LLMAR_REGISTRY     Registry path           default: ~/.llmar/registry.json
 
 Commands:
   list                  Show models on local + archive, with pin status & description
@@ -48,16 +48,16 @@ from pathlib import Path
 # ---------- Configuration ----------
 
 LOCAL_DIR = Path(os.environ.get(
-    "LMMAR_LOCAL_DIR",
+    "LLMAR_LOCAL_DIR",
     str(Path.home() / ".lmstudio" / "models"),
 ))
 ARCHIVE_DIR = Path(os.environ.get(
-    "LMMAR_ARCHIVE_DIR",
+    "LLMAR_ARCHIVE_DIR",
     "/Volumes/INTENSO/llm-archive",
 ))
 REGISTRY_PATH = Path(os.environ.get(
-    "LMMAR_REGISTRY",
-    str(Path.home() / ".lmmar" / "registry.json"),
+    "LLMAR_REGISTRY",
+    str(Path.home() / ".llmar" / "registry.json"),
 ))
 
 
@@ -285,7 +285,7 @@ def cmd_list(args) -> int:
         print(f"{pinned} {loc:3} {human_size(sz):>10}  {m:52}  {desc}")
 
     print()
-    print(f"legend: P=* pinned, LOC=L(local) A(archive)")
+    print("legend: P=* pinned, LOC=L(local) A(archive)")
     print(f"local:   {LOCAL_DIR}    ({human_size(total_local)} across "
           f"{len(local)} model(s))")
     if ARCHIVE_DIR.exists():
@@ -396,7 +396,7 @@ def _perform_archive(registry: dict, candidates: list) -> int:
     print("each model is COPIED to the archive, then REMOVED from local disk.")
     if not confirm("proceed?"):
         print("aborted.")
-        return 1
+        return 0
 
     failed = []
     for m in final_list:
@@ -406,8 +406,17 @@ def _perform_archive(registry: dict, candidates: list) -> int:
         try:
             if dst.exists():
                 # Already archived (e.g., previously restored without removal).
-                # We trust the archive copy and just drop local.
-                print("  already in archive — removing local copy.")
+                # Verify sizes match before trusting the archive copy.
+                src_sz = dir_size(src)
+                dst_sz = dir_size(dst)
+                if src_sz != dst_sz:
+                    raise RuntimeError(
+                        f"archive copy size differs "
+                        f"(local={human_size(src_sz)}, "
+                        f"archive={human_size(dst_sz)}); refusing to remove "
+                        f"local. run 'backup --force {m}' to refresh, then retry."
+                    )
+                print("  already in archive (sizes match) — removing local copy.")
                 shutil.rmtree(src)
             else:
                 print("  copying to archive ...")
@@ -499,7 +508,7 @@ def _perform_backup(registry: dict, candidates: list) -> int:
     print("each model is COPIED to the archive; the local copy stays in place.")
     if not confirm("proceed?"):
         print("aborted.")
-        return 1
+        return 0
 
     failed = []
     for m in final_list:
@@ -583,10 +592,10 @@ def cmd_desc(args) -> int:
     if desc:
         print(f"  description: {desc}")
     else:
-        print(f"  description: (none)")
+        print("  description: (none)")
 
     if not journal:
-        print(f"  journal:     (empty)")
+        print("  journal:     (empty)")
         return 0
 
     word = "entry" if len(journal) == 1 else "entries"
@@ -641,14 +650,14 @@ def cmd_log(args) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        prog="lmmar",
+        prog="llmar",
         description="LM Studio model archiver — local <-> external drive",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "env vars:\n"
-            "  LMMAR_LOCAL_DIR     local model directory\n"
-            "  LMMAR_ARCHIVE_DIR   archive directory\n"
-            "  LMMAR_REGISTRY      registry json path\n"
+            "  LLMAR_LOCAL_DIR     local model directory\n"
+            "  LLMAR_ARCHIVE_DIR   archive directory\n"
+            "  LLMAR_REGISTRY      registry json path\n"
         ),
     )
     sub = parser.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
