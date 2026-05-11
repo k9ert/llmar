@@ -78,6 +78,19 @@ class TestHelp(Base):
         self.assertIn("archive", r.stdout)
         self.assertIn("LLMAR_LOCAL_DIR", r.stdout)
 
+    def test_help_subcommand_prints_docstring(self):
+        r = self.run_cli("help")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("LM Studio Model ARchiver", r.stdout)
+        self.assertIn("LLMAR_LOCAL_DIR", r.stdout)
+        self.assertIn("archive [<model>]", r.stdout)
+
+    def test_no_argv_prints_docstring(self):
+        r = self.run_cli()
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("LM Studio Model ARchiver", r.stdout)
+        self.assertIn("LLMAR_LOCAL_DIR", r.stdout)
+
 
 class TestList(Base):
     def test_empty(self):

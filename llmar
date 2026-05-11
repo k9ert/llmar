@@ -7,25 +7,31 @@ drive. Designed for LM Studio + oMLX, both of which use a two-level model
 directory layout: <publisher>/<model-name>/<weights, config, tokenizer, ...>
 
 Configuration (all overridable via env vars):
-  LLMAR_LOCAL_DIR    Local model directory   default: ~/.lmstudio/models
-  LLMAR_ARCHIVE_DIR  Archive directory       default: /Volumes/INTENSO/llm-archive
-  LLMAR_REGISTRY     Registry path           default: ~/.llmar/registry.json
+  LLMAR_LOCAL_DIR        Local model directory   default: ~/.lmstudio/models
+  LLMAR_ARCHIVE_DIR      Archive directory       default: /Volumes/INTENSO/llm-archive
+  LLMAR_REGISTRY         Registry path           default: ~/.llmar/registry.json
+  LLMAR_RELEASE_API      GitHub releases api base    (used by `update`)
+  LLMAR_RELEASE_DOWNLOAD GitHub releases download base (used by `update`)
 
 Commands:
-  list                  Show models on local + archive, with pin status & description
-  pin     <model>       Mark a model to stay on local disk
-  unpin   <model>       Allow a model to be archived
-  archive [<model>]     Move local model(s) to the archive. With no argument,
-                        archives every unpinned local model. With <model>, just
-                        that one (refuses if pinned, unless --force).
-  backup  [<model>]     Copy local model(s) to the archive WITHOUT removing the
-                        local copy. With no argument, copies every local model
-                        not yet in the archive. With <model>, just that one.
-                        Use --force to overwrite an existing archive copy.
-  restore <model>       Copy a model from the archive back to local
+  list                     Show models on local + archive, with pin status & description
+  pin     <model>          Mark a model to stay on local disk
+  unpin   <model>          Allow a model to be archived
+  archive [<model>]        Move local model(s) to the archive. With no argument,
+                           archives every unpinned local model. With <model>, just
+                           that one (refuses if pinned, unless --force).
+  backup  [<model>]        Copy local model(s) to the archive WITHOUT removing the
+                           local copy. With no argument, copies every local model
+                           not yet in the archive. With <model>, just that one.
+                           Use --force to overwrite an existing archive copy.
+  restore <model>          Copy a model from the archive back to local
   desc    <model>          Show description + full journal for a model
   desc    <model> <text>   Set / update the one-line description
   log     <model> [text]   Append a journal entry. Without [text], opens $EDITOR.
+  update  [<tag>]          Self-update from GitHub releases (default: latest).
+                           --pre to include pre-releases, --force to reinstall.
+  completion <bash|zsh>    Print shell completion script.
+  help                     Show this help text.
 
 Every command that touches a model requires a one-line description. You'll be
 prompted to enter one if it's missing.
@@ -747,7 +753,7 @@ _BASH_COMPLETION = r"""_llmar_complete() {
     local cur
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
-    local subs="list pin unpin archive backup restore desc log update completion"
+    local subs="list pin unpin archive backup restore desc log update completion help"
     local model_cmds=" pin unpin archive backup restore desc log "
 
     if [[ $COMP_CWORD -eq 1 ]]; then
@@ -773,7 +779,7 @@ complete -F _llmar_complete llmar
 _ZSH_COMPLETION = r"""#compdef llmar
 _llmar() {
     local -a subs model_cmds
-    subs=(list pin unpin archive backup restore desc log update completion)
+    subs=(list pin unpin archive backup restore desc log update completion help)
     model_cmds=(pin unpin archive backup restore desc log)
 
     if (( CURRENT == 2 )); then
@@ -815,6 +821,11 @@ def cmd_complete_models(args) -> int:
     return 0
 
 
+def cmd_help(args) -> int:
+    print((__doc__ or "").strip())
+    return 0
+
+
 # ---------- Main ----------
 
 def main() -> int:
@@ -833,7 +844,7 @@ def main() -> int:
     )
     parser.add_argument("--version", action="version",
                         version=f"%(prog)s {__version__}")
-    sub = parser.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+    sub = parser.add_subparsers(dest="cmd", required=False, metavar="COMMAND")
 
     sub.add_parser("list", help="list models on local + archive")
 
@@ -898,7 +909,12 @@ def main() -> int:
     sub.add_parser("_complete-models",
                    help="list known model ids (used by completion scripts)")
 
+    sub.add_parser("help", help="show full help text")
+
     args = parser.parse_args()
+
+    if args.cmd is None:
+        return cmd_help(args)
 
     handlers = {
         "list":    cmd_list,
@@ -912,6 +928,7 @@ def main() -> int:
         "update":  cmd_update,
         "completion":        cmd_completion,
         "_complete-models":  cmd_complete_models,
+        "help":    cmd_help,
     }
     return handlers[args.cmd](args)
 
